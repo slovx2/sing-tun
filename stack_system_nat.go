@@ -26,10 +26,12 @@ type tcpNatKey struct {
 
 type TCPSession struct {
 	sync.Mutex
-	Source      netip.AddrPort
-	Destination netip.AddrPort
-	LastActive  time.Time
-	acceptState atomic.Uint32
+	Source         netip.AddrPort
+	Destination    netip.AddrPort
+	LastActive     time.Time
+	acceptState    atomic.Uint32
+	acceptDoneOnce sync.Once
+	acceptDone     chan struct{}
 }
 
 const (
@@ -37,6 +39,7 @@ const (
 	tcpAcceptSynAckSeen
 	tcpAcceptAwaiting
 	tcpAcceptAccepted
+	tcpAcceptHandoffTimeout = 100 * time.Millisecond
 )
 
 // observeReverse records the listener side of the TCP handshake.
@@ -68,7 +71,33 @@ func (s *TCPSession) observeForward(flags header.TCPFlags) bool {
 }
 
 func (s *TCPSession) markAccepted() {
-	s.acceptState.Store(tcpAcceptAccepted)
+	acceptDone := s.acceptedChannel()
+	if s.acceptState.Swap(tcpAcceptAccepted) != tcpAcceptAccepted {
+		close(acceptDone)
+	}
+}
+
+func (s *TCPSession) acceptedChannel() chan struct{} {
+	s.acceptDoneOnce.Do(func() {
+		s.acceptDone = make(chan struct{})
+	})
+	return s.acceptDone
+}
+
+func (s *TCPSession) waitAccepted(ctx context.Context, timeout time.Duration) bool {
+	if s.acceptState.Load() == tcpAcceptAccepted {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-s.acceptedChannel():
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
 }
 
 func NewNat(ctx context.Context, timeout time.Duration) *TCPNat {

@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"runtime"
 	"slices"
 	"syscall"
 	"time"
@@ -415,7 +414,9 @@ func (s *System) handoffTCPAccept(packet []byte) {
 		return
 	}
 	if session != nil && session.observeForward(tcpHdr.Flags()) {
-		runtime.Gosched()
+		if !session.waitAccepted(s.ctx, tcpAcceptHandoffTimeout) {
+			s.logger.Trace("TCP accept handoff timed out")
+		}
 	}
 }
 

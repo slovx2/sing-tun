@@ -1,8 +1,10 @@
 package tun
 
 import (
+	"context"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/stretchr/testify/require"
@@ -27,6 +29,26 @@ func TestTCPSessionAcceptHandoffLifecycle(t *testing.T) {
 	// acceptLoop 接管连接后，数据阶段 ACK 不得再触发调度交接。
 	session.markAccepted()
 	require.False(t, session.observeForward(header.TCPFlagAck))
+	require.True(t, session.waitAccepted(context.Background(), time.Second))
+}
+
+func TestTCPSessionAcceptHandoffWaitsForOwnership(t *testing.T) {
+	session := &TCPSession{}
+	started := make(chan struct{})
+	accepted := make(chan bool, 1)
+	go func() {
+		close(started)
+		accepted <- session.waitAccepted(context.Background(), time.Second)
+	}()
+	<-started
+	select {
+	case <-accepted:
+		t.Fatal("handoff completed before acceptLoop took ownership")
+	default:
+	}
+
+	session.markAccepted()
+	require.True(t, <-accepted)
 }
 
 func TestTCPSessionDoesNotHandoffOrdinaryACK(t *testing.T) {
