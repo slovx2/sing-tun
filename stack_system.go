@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"slices"
 	"syscall"
 	"time"
@@ -240,6 +241,8 @@ func (s *System) tunLoop() {
 			_, err = s.tun.Write(rawPacket)
 			if err != nil {
 				s.logger.Trace(E.Cause(err, "write packet"))
+			} else {
+				s.handoffTCPAccept(packet)
 			}
 		}
 		s.dispatcher.Flush()
@@ -260,6 +263,8 @@ func (s *System) wintunLoop(winTun WinTun) {
 			_, err = winTun.Write(packet)
 			if err != nil {
 				s.logger.Trace(E.Cause(err, "write packet"))
+			} else {
+				s.handoffTCPAccept(packet)
 			}
 		}
 		s.dispatcher.Flush()
@@ -300,6 +305,10 @@ func (s *System) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 			_, err = linuxTUN.BatchWrite(writeBuffers, s.frontHeadroom)
 			if err != nil {
 				s.logger.Trace(E.Cause(err, "batch write packet"))
+			} else {
+				for _, packetBuffer := range writeBuffers {
+					s.handoffTCPAccept(packetBuffer[s.frontHeadroom:])
+				}
 			}
 			writeBuffers = writeBuffers[:0]
 		}
@@ -339,6 +348,10 @@ func (s *System) batchLoopDarwin(darwinTUN DarwinTUN) {
 			err = darwinTUN.BatchWrite(writeBuffers)
 			if err != nil {
 				s.logger.Trace(E.Cause(err, "batch write packet"))
+			} else {
+				for _, packetBuffer := range writeBuffers {
+					s.handoffTCPAccept(packetBuffer.Bytes())
+				}
 			}
 			buf.ReleaseMulti(writeBuffers)
 		}
@@ -367,6 +380,45 @@ func (s *System) processPacket(packet []byte) bool {
 	return writeBack
 }
 
+// handoffTCPAccept transfers execution from the TUN data path to acceptLoop
+// after the final handshake ACK has been written successfully. It is scoped to
+// the matching session, so established data ACKs do not add scheduler yields.
+func (s *System) handoffTCPAccept(packet []byte) {
+	var (
+		tcpHdr  header.TCP
+		session *TCPSession
+	)
+	switch header.IPVersion(packet) {
+	case header.IPv4Version:
+		ipHdr := header.IPv4(packet)
+		if ipHdr.TransportProtocol() != header.TCPProtocolNumber || len(ipHdr.Payload()) < header.TCPMinimumSize ||
+			ipHdr.SourceAddr() != s.inet4NextAddress || ipHdr.DestinationAddr() != s.inet4Address {
+			return
+		}
+		tcpHdr = header.TCP(ipHdr.Payload())
+		if tcpHdr.DestinationPort() != s.tcpPort {
+			return
+		}
+		session = s.tcpNat.LookupBack(tcpHdr.SourcePort())
+	case header.IPv6Version:
+		ipHdr := header.IPv6(packet)
+		if ipHdr.TransportProtocol() != header.TCPProtocolNumber || len(ipHdr.Payload()) < header.TCPMinimumSize ||
+			ipHdr.SourceAddr() != s.inet6NextAddress || ipHdr.DestinationAddr() != s.inet6Address {
+			return
+		}
+		tcpHdr = header.TCP(ipHdr.Payload())
+		if tcpHdr.DestinationPort() != s.tcpPort6 {
+			return
+		}
+		session = s.tcpNat.LookupBack(tcpHdr.SourcePort())
+	default:
+		return
+	}
+	if session != nil && session.observeForward(tcpHdr.Flags()) {
+		runtime.Gosched()
+	}
+}
+
 func (s *System) acceptLoop(listener net.Listener) {
 	for {
 		conn, err := listener.Accept()
@@ -379,6 +431,7 @@ func (s *System) acceptLoop(listener net.Listener) {
 			s.logger.Trace(E.New("unknown session with port ", connPort))
 			continue
 		}
+		session.markAccepted()
 		go s.handler.NewConnectionEx(s.ctx, conn, M.SocksaddrFromNetIP(session.Source), M.SocksaddrFromNetIP(session.Destination), nil)
 	}
 }
@@ -480,6 +533,7 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 		if session == nil {
 			return false, E.New("ipv4: tcp: session not found: ", destination.Port())
 		}
+		session.observeReverse(tcpHdr.Flags())
 		rewriteIPv4TCP(ipHdr, tcpHdr, s.txChecksumOffload,
 			session.Destination.Addr(), session.Destination.Port(), true,
 			session.Source.Addr(), session.Source.Port(), true)
@@ -517,6 +571,7 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 		if session == nil {
 			return false, E.New("ipv6: tcp: session not found: ", destination.Port())
 		}
+		session.observeReverse(tcpHdr.Flags())
 		rewriteIPv6TCP(ipHdr, tcpHdr, s.txChecksumOffload,
 			session.Destination.Addr(), session.Destination.Port(), true,
 			session.Source.Addr(), session.Source.Port(), true)

@@ -118,6 +118,8 @@ func (m *Mixed) tunLoop() {
 			_, err = m.tun.Write(rawPacket)
 			if err != nil {
 				m.logger.Trace(E.Cause(err, "write packet"))
+			} else {
+				m.handoffTCPAccept(packet)
 			}
 		}
 		m.dispatcher.Flush()
@@ -138,6 +140,8 @@ func (m *Mixed) wintunLoop(winTun WinTun) {
 			_, err = winTun.Write(packet)
 			if err != nil {
 				m.logger.Trace(E.Cause(err, "write packet"))
+			} else {
+				m.handoffTCPAccept(packet)
 			}
 		}
 		m.dispatcher.Flush()
@@ -178,6 +182,10 @@ func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 			_, err = linuxTUN.BatchWrite(writeBuffers, m.frontHeadroom)
 			if err != nil {
 				m.logger.Trace(E.Cause(err, "batch write packet"))
+			} else {
+				for _, packetBuffer := range writeBuffers {
+					m.handoffTCPAccept(packetBuffer[m.frontHeadroom:])
+				}
 			}
 			writeBuffers = writeBuffers[:0]
 		}
@@ -217,6 +225,10 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 			err = darwinTUN.BatchWrite(writeBuffers)
 			if err != nil {
 				m.logger.Trace(E.Cause(err, "batch write packet"))
+			} else {
+				for _, packetBuffer := range writeBuffers {
+					m.handoffTCPAccept(packetBuffer.Bytes())
+				}
 			}
 			buf.ReleaseMulti(writeBuffers)
 		}

@@ -4,7 +4,10 @@ import (
 	"context"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/sagernet/sing-tun/gtcpip/header"
 )
 
 type TCPNat struct {
@@ -26,6 +29,46 @@ type TCPSession struct {
 	Source      netip.AddrPort
 	Destination netip.AddrPort
 	LastActive  time.Time
+	acceptState atomic.Uint32
+}
+
+const (
+	tcpAcceptInitial uint32 = iota
+	tcpAcceptSynAckSeen
+	tcpAcceptAwaiting
+	tcpAcceptAccepted
+)
+
+// observeReverse records the listener side of the TCP handshake.
+func (s *TCPSession) observeReverse(flags header.TCPFlags) {
+	if flags.Contains(header.TCPFlagSyn | header.TCPFlagAck) {
+		s.acceptState.CompareAndSwap(tcpAcceptInitial, tcpAcceptSynAckSeen)
+	}
+}
+
+// observeForward reports whether the final handshake ACK should hand
+// execution to acceptLoop. Retransmitted ACKs keep requesting the handoff
+// until acceptLoop has taken ownership of the connection.
+func (s *TCPSession) observeForward(flags header.TCPFlags) bool {
+	if !flags.Contains(header.TCPFlagAck) || flags.Intersects(header.TCPFlagSyn|header.TCPFlagRst|header.TCPFlagFin) {
+		return false
+	}
+	for {
+		switch state := s.acceptState.Load(); state {
+		case tcpAcceptSynAckSeen:
+			if s.acceptState.CompareAndSwap(state, tcpAcceptAwaiting) {
+				return true
+			}
+		case tcpAcceptAwaiting:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func (s *TCPSession) markAccepted() {
+	s.acceptState.Store(tcpAcceptAccepted)
 }
 
 func NewNat(ctx context.Context, timeout time.Duration) *TCPNat {
